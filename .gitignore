@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+.python-version
+
+screenshots/
+*.png
+!docs/**/*.png
+
+# SeleniumBase 运行时产物
+latest_logs/
+archived_logs/
+downloaded_files/
+assets/
+geckodriver.log
+
+.env
+.env.local
+
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,4 @@
+seleniumbase==4.53.7
+requests>=2.31.0
+# Linux 上 seleniumbase 自己会带 PyAutoGUI；macOS 本地调试需要显式安装
+pyautogui>=0.9.54; sys_platform == "darwin"

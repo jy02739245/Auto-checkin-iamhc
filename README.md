@@ -2,7 +2,7 @@
 
 自动登录 [api.hcnsec.cn](https://api.hcnsec.cn)并执行每日签到，签到后通过 Telegram 推送通知(可选)。
 
-
+test
 ### 配置 Secrets
 
 在仓库 **Settings → Secrets and variables → Actions** 中添加以下 Secrets：

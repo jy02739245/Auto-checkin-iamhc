@@ -1,13 +1,19 @@
-"""把机场分享链接转成 sing-box 配置，并在本地拉一个 HTTP 代理入口。
+"""把机场分享链接转成本地 HTTP 代理入口。
 
 Chrome 的 `--proxy-server` 只认 http / socks，vless、vmess、tuic、hysteria2、anytls
-这些协议它一个都不懂。所以这里的做法是：用 sing-box 把节点链接接起来，在
-127.0.0.1 上开一个 mixed 入口，再让浏览器走这个本地代理。
+这些协议它一个都不懂。所以这里的做法是：用 sing-box 或 Xray 把节点链接接起来，在
+127.0.0.1 上开一个 HTTP 入口，再让浏览器走这个本地代理。
+
+默认按传输方式自动选后端：
+    xhttp / splithttp  → Xray（sing-box 至今没有 XHTTP 传输）
+    其他协议           → sing-box（保留 tuic / hysteria2 / anytls / ss 插件）
 
 环境变量：
     IAMHC_NODE_LINK / NODE_LINK   节点分享链接（支持多条，按行或空格分隔，取第一条）
     IAMHC_PROXY_PORT              本地代理端口，默认 1081
+    IAMHC_PROXY_BACKEND           后端：auto（默认）/ xray / sing-box
     SING_BOX_PATH                 sing-box 可执行文件路径，默认从 PATH 找
+    XRAY_PATH                     Xray 可执行文件路径，默认从 PATH 找
 
 也可以单独当命令行用，方便本地排查链接解析结果：
     python -m src.proxy_node --print-config
@@ -33,13 +39,20 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 NODE_LINK_ENVS = ("IAMHC_NODE_LINK", "NODE_LINK")
 PROXY_PORT_ENV = "IAMHC_PROXY_PORT"
+BACKEND_ENV = "IAMHC_PROXY_BACKEND"
 SING_BOX_PATH_ENV = "SING_BOX_PATH"
+XRAY_PATH_ENV = "XRAY_PATH"
 
 DEFAULT_PROXY_PORT = 1081
 OUTBOUND_TAG = "node"
 READY_TIMEOUT_SECONDS = 20
 
-# Chrome 能直接消化的协议；没有账号密码时不需要 sing-box 中转
+BACKEND_AUTO = "auto"
+BACKEND_XRAY = "xray"
+BACKEND_SING_BOX = "sing-box"
+XHTTP_TRANSPORTS = ("xhttp", "splithttp")
+
+# Chrome 能直接消化的协议；没有账号密码时不需要本地中转
 # （Chrome 的 --proxy-server 不支持在 URL 里带用户名密码）
 CHROME_NATIVE_SCHEMES = ("http", "https", "socks5", "socks5h", "socks4", "socks")
 
@@ -50,6 +63,10 @@ class UnsupportedNodeLink(Exception):
 
 class SingBoxNotFound(Exception):
     """需要 sing-box 但没找到可执行文件。"""
+
+
+class XrayNotFound(Exception):
+    """需要 Xray 但没找到可执行文件。"""
 
 
 def node_link_from_env() -> Optional[str]:
@@ -96,6 +113,36 @@ def _first(query: dict[str, list[str]], *names: str, default: str = "") -> str:
 
 def _is_true(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def link_transport(link: str) -> str:
+    """取分享链接的传输方式（ws / grpc / xhttp / ...），取不到时返回空串。"""
+    link = link.strip()
+    scheme = link.split("://", 1)[0].lower() if "://" in link else ""
+    if scheme == "vmess":
+        try:
+            config = json.loads(_b64decode(link[len("vmess://"):]))
+        except (UnsupportedNodeLink, json.JSONDecodeError):
+            return ""
+        if isinstance(config, dict):
+            return str(config.get("net") or config.get("type") or "").strip().lower()
+        return ""
+    if not scheme:
+        return ""
+    return _first(parse_qs(urlsplit(link).query), "type", "net").lower()
+
+
+def backend_for_link(link: str) -> str:
+    """选后端：xhttp 交给 Xray，其余交给 sing-box；可用环境变量强制。"""
+    forced = os.environ.get(BACKEND_ENV, "").strip().lower()
+    if forced in (BACKEND_XRAY, "singbox", BACKEND_SING_BOX):
+        return BACKEND_XRAY if forced == BACKEND_XRAY else BACKEND_SING_BOX
+    if forced and forced != BACKEND_AUTO:
+        print(f"[node] {BACKEND_ENV}={forced} 不是有效值，按 auto 处理")
+
+    if link_transport(link) in XHTTP_TRANSPORTS:
+        return BACKEND_XRAY
+    return BACKEND_SING_BOX
 
 
 def _alpn_list(value: str) -> list[str]:
@@ -456,6 +503,290 @@ def parse_link(link: str) -> dict[str, Any]:
     return outbound
 
 
+def _xray_network(query: dict[str, list[str]]) -> str:
+    """把链接里的 type/net 映射成 Xray 的 streamSettings.network。"""
+    kind = _first(query, "type", "net").lower()
+    if kind in ("", "tcp", "none", "raw"):
+        return "tcp"
+    if kind in XHTTP_TRANSPORTS:
+        return "xhttp"
+    if kind in ("ws", "websocket"):
+        return "ws"
+    if kind == "grpc":
+        return "grpc"
+    if kind == "httpupgrade":
+        return "httpupgrade"
+    # 当前 Xray 已移除 http / h2 / h3 / quic 传输，并建议改用 XHTTP
+    raise UnsupportedNodeLink(f"Xray 后端不支持的传输方式: {kind}")
+
+
+def _xray_transport_block(query: dict[str, list[str]]) -> dict[str, Any]:
+    network = _xray_network(query)
+    if network == "xhttp":
+        path = _first(query, "path", default="/") or "/"
+        mode = (_first(query, "mode", default="auto") or "auto").lower()
+        host = _first(query, "host")
+        xhttp: dict[str, Any] = {"path": path, "mode": mode}
+        if host:
+            xhttp["host"] = host
+
+        # v2rayN 把 XHTTP 的高级参数塞在 extra=<urlencoded JSON> 里。
+        raw_extra = _first(query, "extra")
+        if raw_extra:
+            try:
+                extra = json.loads(raw_extra)
+            except json.JSONDecodeError as exc:
+                raise UnsupportedNodeLink(f"xhttp extra 不是合法 JSON: {exc}") from exc
+            if not isinstance(extra, dict):
+                raise UnsupportedNodeLink("xhttp extra 必须是 JSON 对象")
+            xhttp.update(extra)
+            # 链接顶层的 host/path/mode 优先级更高
+            if host:
+                xhttp["host"] = host
+            xhttp["path"] = path
+            xhttp["mode"] = mode
+        return {"network": "xhttp", "xhttpSettings": xhttp}
+
+    if network == "ws":
+        transport: dict[str, Any] = {"path": _first(query, "path", default="/")}
+        host = _first(query, "host")
+        if host:
+            transport["headers"] = {"Host": host}
+        return {"network": "ws", "wsSettings": transport}
+
+    if network == "grpc":
+        return {
+            "network": "grpc",
+            "grpcSettings": {"serviceName": _first(query, "serviceName", "path")},
+        }
+
+    if network == "httpupgrade":
+        transport = {"path": _first(query, "path", default="/")}
+        host = _first(query, "host")
+        if host:
+            transport["host"] = host
+        return {"network": "httpupgrade", "httpupgradeSettings": transport}
+
+    return {"network": "tcp"}
+
+
+def _xray_security_block(
+    query: dict[str, list[str]],
+    server: str,
+    *,
+    default_tls: bool = False,
+) -> dict[str, Any]:
+    security = _first(query, "security").lower()
+    public_key = _first(query, "pbk", "public-key")
+
+    if security == "reality" or public_key:
+        if not public_key:
+            raise UnsupportedNodeLink("Xray REALITY 链接缺少 pbk（公钥）")
+        return {
+            "security": "reality",
+            "realitySettings": {
+                "serverName": _first(query, "sni", "peer", default=server),
+                "fingerprint": _first(query, "fp", "client-fingerprint", default="chrome"),
+                "publicKey": public_key,
+                "shortId": _first(query, "sid", "short-id"),
+                "spiderX": _first(query, "spx", "spider-x", default="/"),
+            },
+        }
+
+    # 旧链接可能写 security=xtls；Xray 已移除旧 XTLS，按普通 TLS 处理
+    if security in ("tls", "xtls") or default_tls:
+        tls: dict[str, Any] = {
+            "serverName": _first(query, "sni", "peer", default=server),
+        }
+        if _is_true(_first(query, "insecure", "allowInsecure", "allow_insecure")):
+            tls["allowInsecure"] = True
+        alpn = _alpn_list(_first(query, "alpn"))
+        if alpn:
+            tls["alpn"] = alpn
+        fingerprint = _first(query, "fp", "client-fingerprint")
+        if fingerprint:
+            tls["fingerprint"] = fingerprint
+        return {"security": "tls", "tlsSettings": tls}
+
+    return {"security": "none"}
+
+
+def _xray_stream_settings(
+    query: dict[str, list[str]],
+    server: str,
+    *,
+    default_tls: bool = False,
+) -> dict[str, Any]:
+    stream = _xray_transport_block(query)
+    stream.update(_xray_security_block(query, server, default_tls=default_tls))
+    return stream
+
+
+def _parse_xray_vless(parts, query) -> dict[str, Any]:
+    if not parts.username:
+        raise UnsupportedNodeLink("vless 链接缺少 uuid")
+
+    user: dict[str, Any] = {
+        "id": unquote(parts.username),
+        "encryption": _first(query, "encryption", default="none") or "none",
+    }
+    # Vision 只适用于 TCP + TLS/REALITY；XHTTP 带了 flow 会被 Xray 拒绝
+    flow = _first(query, "flow")
+    if flow and _xray_network(query) == "tcp":
+        user["flow"] = flow
+
+    return {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": parts.hostname,
+                    "port": _require_port(parts.port, "vless"),
+                    "users": [user],
+                }
+            ]
+        },
+        "streamSettings": _xray_stream_settings(query, parts.hostname or ""),
+    }
+
+
+def _parse_xray_vmess(link: str) -> dict[str, Any]:
+    payload = link[len("vmess://"):]
+    try:
+        config = json.loads(_b64decode(payload))
+    except json.JSONDecodeError as exc:
+        raise UnsupportedNodeLink(
+            "vmess 链接不是 v2rayN 的 base64(JSON) 格式，无法解析"
+        ) from exc
+    if not isinstance(config, dict):
+        raise UnsupportedNodeLink("vmess 链接内容不是 JSON 对象")
+
+    server = str(config.get("add", ""))
+    if not server:
+        raise UnsupportedNodeLink("vmess 链接缺少服务器地址")
+
+    query: dict[str, list[str]] = {
+        key: [str(config[key])]
+        for key in ("sni", "host", "path", "alpn", "fp", "serviceName")
+        if config.get(key)
+    }
+    query["type"] = [str(config.get("net") or config.get("type") or "tcp")]
+    if str(config.get("tls", "")).lower() == "tls":
+        query["security"] = ["tls"]
+    if _is_true(str(config.get("allowInsecure", ""))):
+        query["allowInsecure"] = ["1"]
+
+    return {
+        "protocol": "vmess",
+        "settings": {
+            "vnext": [
+                {
+                    "address": server,
+                    "port": _require_port(int(config.get("port") or 0), "vmess"),
+                    "users": [
+                        {
+                            "id": str(config.get("id", "")),
+                            "alterId": int(config.get("aid") or 0),
+                            "security": str(config.get("scy") or "auto"),
+                        }
+                    ],
+                }
+            ]
+        },
+        "streamSettings": _xray_stream_settings(query, server),
+    }
+
+
+def _parse_xray_trojan(parts, query) -> dict[str, Any]:
+    if not parts.username:
+        raise UnsupportedNodeLink("trojan 链接缺少密码")
+
+    return {
+        "protocol": "trojan",
+        "settings": {
+            "servers": [
+                {
+                    "address": parts.hostname,
+                    "port": _require_port(parts.port, "trojan"),
+                    "password": unquote(parts.username),
+                }
+            ]
+        },
+        # trojan 默认跑在 TLS 上，除非显式写了 security=none
+        "streamSettings": _xray_stream_settings(
+            query,
+            parts.hostname or "",
+            default_tls=_first(query, "security").lower() != "none",
+        ),
+    }
+
+
+def _parse_xray_shadowsocks(link: str) -> dict[str, Any]:
+    outbound = _parse_shadowsocks(link)
+    if outbound.get("plugin"):
+        raise UnsupportedNodeLink("Xray 后端不支持 ss 插件，请改用 sing-box（IAMHC_PROXY_BACKEND=sing-box）")
+    return {
+        "protocol": "shadowsocks",
+        "settings": {
+            "servers": [
+                {
+                    "address": outbound["server"],
+                    "port": outbound["server_port"],
+                    "method": outbound["method"],
+                    "password": outbound["password"],
+                }
+            ]
+        },
+    }
+
+
+def parse_link_xray(link: str) -> dict[str, Any]:
+    """把分享链接解析成一个 Xray outbound。"""
+    link = link.strip()
+    scheme = link.split("://", 1)[0].lower() if "://" in link else ""
+    if not scheme:
+        raise UnsupportedNodeLink("链接缺少协议前缀（形如 vless:// hysteria2://）")
+
+    if scheme == "vmess":
+        outbound = _parse_xray_vmess(link)
+    else:
+        parts = urlsplit(link)
+        query = parse_qs(parts.query)
+        if scheme == "vless":
+            outbound = _parse_xray_vless(parts, query)
+        elif scheme == "trojan":
+            outbound = _parse_xray_trojan(parts, query)
+        elif scheme == "ss":
+            outbound = _parse_xray_shadowsocks(link)
+        else:
+            raise UnsupportedNodeLink(
+                f"Xray 后端不支持协议: {scheme}（tuic / hysteria2 / anytls 请用 sing-box）"
+            )
+
+    outbound["tag"] = OUTBOUND_TAG
+    return outbound
+
+
+def build_xray_config(link: str, port: int) -> dict[str, Any]:
+    """生成一份「本地 HTTP 入口 + 一个节点出口」的 Xray 配置。
+
+    Xray 没有 sing-box 的 mixed 入站；Chrome 拿到的是 http:// 代理，
+    所以这里只开 HTTP 入站就够了。
+    """
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": port,
+                "protocol": "http",
+                "settings": {},
+            }
+        ],
+        "outbounds": [parse_link_xray(link)],
+    }
+
+
 def chrome_native_proxy(link: str) -> Optional[str]:
     """能直接交给 Chrome 的链接就别多绕一层 sing-box。
 
@@ -473,7 +804,7 @@ def chrome_native_proxy(link: str) -> Optional[str]:
     return f"{scheme}://{parts.hostname}:{parts.port}"
 
 
-def build_config(link: str, port: int) -> dict[str, Any]:
+def build_singbox_config(link: str, port: int) -> dict[str, Any]:
     """生成一份只有「本地 mixed 入口 + 一个节点出口」的 sing-box 配置。"""
     return {
         "log": {"level": "warn", "timestamp": True},
@@ -488,6 +819,19 @@ def build_config(link: str, port: int) -> dict[str, Any]:
         "outbounds": [parse_link(link)],
         "route": {"final": OUTBOUND_TAG},
     }
+
+
+def build_config(
+    link: str,
+    port: int,
+    backend: Optional[str] = None,
+) -> dict[str, Any]:
+    """按链接的传输方式生成对应后端的配置。"""
+    if not backend or backend == BACKEND_AUTO:
+        backend = backend_for_link(link)
+    if backend == BACKEND_XRAY:
+        return build_xray_config(link, port)
+    return build_singbox_config(link, port)
 
 
 def _find_sing_box() -> str:
@@ -506,6 +850,41 @@ def _find_sing_box() -> str:
     return found
 
 
+def _find_xray() -> str:
+    configured = os.environ.get(XRAY_PATH_ENV, "").strip()
+    if configured:
+        if not os.path.exists(configured):
+            raise XrayNotFound(f"{XRAY_PATH_ENV} 指向的文件不存在: {configured}")
+        return configured
+
+    found = shutil.which("xray")
+    if not found:
+        raise XrayNotFound(
+            "没找到 Xray。macOS 可以 `brew install xray`，"
+            "Linux 从 https://github.com/XTLS/Xray-core/releases 下载后放进 PATH"
+        )
+    return found
+
+
+def _outbound_summary(config: dict[str, Any], backend: str) -> tuple[str, Any, Any]:
+    """打印用：统一取出协议、服务器、端口。"""
+    outbound = config["outbounds"][0]
+    if backend == BACKEND_XRAY:
+        protocol = str(outbound.get("protocol", ""))
+        settings = outbound.get("settings", {})
+        if protocol in ("vless", "vmess"):
+            target = (settings.get("vnext") or [{}])[0]
+        else:
+            target = (settings.get("servers") or [{}])[0]
+        return protocol, target.get("address"), target.get("port")
+
+    return (
+        str(outbound.get("type", "")),
+        outbound.get("server"),
+        outbound.get("server_port"),
+    )
+
+
 def _wait_until_listening(port: int, process: subprocess.Popen) -> bool:
     deadline = time.time() + READY_TIMEOUT_SECONDS
     while time.time() < deadline:
@@ -520,18 +899,26 @@ def _wait_until_listening(port: int, process: subprocess.Popen) -> bool:
 
 
 @contextmanager
-def launch(link: str, port: Optional[int] = None) -> Iterator[str]:
-    """起一个 sing-box，yield 出浏览器该用的本地代理地址。"""
+def launch(
+    link: str,
+    port: Optional[int] = None,
+    backend: Optional[str] = None,
+) -> Iterator[str]:
+    """起 Xray 或 sing-box，yield 出浏览器该用的本地代理地址。"""
     port = port or proxy_port_from_env()
-    binary = _find_sing_box()
-    config = build_config(link, port)
-    outbound_type = config["outbounds"][0]["type"]
+    if not backend or backend == BACKEND_AUTO:
+        backend = backend_for_link(link)
+    config = build_config(link, port, backend)
+    label = "Xray" if backend == BACKEND_XRAY else "sing-box"
+    outbound_type = _outbound_summary(config, backend)[0]
+
+    binary = _find_xray() if backend == BACKEND_XRAY else _find_sing_box()
 
     workdir = tempfile.mkdtemp(prefix="iamhc-node-")
-    config_path = Path(workdir) / "sing-box.json"
+    config_path = Path(workdir) / f"{backend}.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), "utf-8")
 
-    print(f"[node] 启动 sing-box: {outbound_type} 节点 → 127.0.0.1:{port}")
+    print(f"[node] 启动 {label}: {outbound_type} 节点 → 127.0.0.1:{port}")
     process = subprocess.Popen(
         [binary, "run", "-c", str(config_path)],
         cwd=workdir,
@@ -546,7 +933,7 @@ def launch(link: str, port: Optional[int] = None) -> Iterator[str]:
             if process.poll() is not None and process.stdout:
                 output = process.stdout.read()[-800:]
             raise RuntimeError(
-                f"sing-box {READY_TIMEOUT_SECONDS}s 内没有监听 127.0.0.1:{port}"
+                f"{label} {READY_TIMEOUT_SECONDS}s 内没有监听 127.0.0.1:{port}"
                 + (f"；输出: {output.strip()}" if output else "")
             )
 
@@ -554,13 +941,13 @@ def launch(link: str, port: Optional[int] = None) -> Iterator[str]:
         _log_egress_ip(proxy_url)
         yield proxy_url
     finally:
-        _shutdown(process)
+        _shutdown(process, label)
         shutil.rmtree(workdir, ignore_errors=True)
 
 
 @contextmanager
 def maybe_launch() -> Iterator[Optional[str]]:
-    """配了节点链接就起 sing-box，否则什么都不做。"""
+    """配了节点链接就起对应后端，否则什么都不做。"""
     link = node_link_from_env()
     if not link:
         yield None
@@ -595,7 +982,7 @@ def _log_egress_ip(proxy_url: str) -> None:
         print(f"[node] 查询出口 IP 失败: {type(exc).__name__}: {exc}")
 
 
-def _shutdown(process: subprocess.Popen) -> None:
+def _shutdown(process: subprocess.Popen, label: str = "节点进程") -> None:
     if process.poll() is not None:
         return
     process.terminate()
@@ -603,17 +990,23 @@ def _shutdown(process: subprocess.Popen) -> None:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
-    print("[node] sing-box 已退出")
+    print(f"[node] {label} 已退出")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="节点链接 → sing-box 配置")
+    parser = argparse.ArgumentParser(description="节点链接 → Xray / sing-box 配置")
     parser.add_argument("--link", help="节点分享链接，默认读环境变量")
     parser.add_argument("--port", type=int, help="本地代理端口")
     parser.add_argument(
+        "--backend",
+        choices=(BACKEND_AUTO, BACKEND_XRAY, BACKEND_SING_BOX),
+        default=BACKEND_AUTO,
+        help="代理后端，默认按传输方式自动选择",
+    )
+    parser.add_argument(
         "--print-config",
         action="store_true",
-        help="只打印生成的 sing-box 配置（密码等字段会原样出现，注意别贴到公开地方）",
+        help="只打印生成的配置（密码等字段会原样出现，注意别贴到公开地方）",
     )
     args = parser.parse_args(argv)
 
@@ -623,8 +1016,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     port = args.port or proxy_port_from_env()
+    backend = args.backend
+    if backend == BACKEND_AUTO:
+        backend = backend_for_link(link)
+
     try:
-        config = build_config(link, port)
+        config = build_config(link, port, backend)
     except UnsupportedNodeLink as exc:
         print(f"[node] 链接解析失败: {exc}")
         return 1
@@ -633,10 +1030,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(config, ensure_ascii=False, indent=2))
         return 0
 
-    outbound = config["outbounds"][0]
+    outbound_type, server, server_port = _outbound_summary(config, backend)
     print(
-        f"[node] 解析成功: type={outbound['type']} "
-        f"server={outbound['server']}:{outbound['server_port']}"
+        f"[node] 解析成功: backend={backend} type={outbound_type} "
+        f"server={server}:{server_port}"
     )
     return 0
 

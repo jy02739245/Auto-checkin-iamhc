@@ -62,6 +62,20 @@ jobs:
           sudo install -m 0755 "/tmp/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version
 
+      - name: Install Xray for NODE_LINK xhttp proxy
+        if: env.NODE_LINK != ''
+        env:
+          XRAY_VERSION: 'v26.10.31'
+          XRAY_SHA256: 'e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214'
+        run: |
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            -o /tmp/xray.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+          echo "${XRAY_SHA256}  /tmp/xray.zip" | sha256sum -c -
+          unzip -oq /tmp/xray.zip -d /tmp/xray
+          sudo install -m 0755 /tmp/xray/xray /usr/local/bin/xray
+          xray version
+
       - name: Verify browser, fonts and GUI deps
         run: |
           which google-chrome || which google-chrome-stable || true

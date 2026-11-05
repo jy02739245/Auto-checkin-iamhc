@@ -12,7 +12,7 @@
 5. 结果通过 Telegram 推送（可选）
 
 > 站点有需要过盾的代理场景时，配置 `NODE_LINK` 即可让浏览器走机场节点：复杂协议由
-> sing-box 在本地开一个 HTTP 入口，Chrome 只认这个本地代理。
+> sing-box / Xray 在本地开一个 HTTP 入口，Chrome 只认这个本地代理。
 
 ## 为什么是「浏览器里发请求」
 
@@ -36,7 +36,7 @@ widget 渲染在哪。
 │   ├── browser.py                  # SeleniumBase UC 模式 + Turnstile 过盾 + 截图
 │   ├── page_api.py                 # 在页面上下文里发 fetch 并把结果取回
 │   ├── site.py                     # 接口语义、响应判定、额度格式化
-│   ├── proxy_node.py               # 节点链接 → sing-box 配置 → 本地 HTTP 代理
+│   ├── proxy_node.py               # 节点链接 → Xray / sing-box 配置 → 本地 HTTP 代理
 │   ├── notify.py                   # Telegram 通知
 │   └── env.py                      # 本地 .env.local 加载
 ├── tests/                          # 不启浏览器的单元测试
@@ -68,29 +68,49 @@ widget 渲染在哪。
 | `IAMHC_BROWSER_PROXY` | 浏览器代理，如 `http://127.0.0.1:7890`；不配时自动读 `HTTPS_PROXY`/`HTTP_PROXY` |
 | `IAMHC_USER_AGENT` | 覆盖浏览器 UA。默认留空，用 Chrome 真实 UA（改 UA 反而更容易被风控） |
 | `IAMHC_DISABLE_GUI_CLICK` | 设为 `1` 时不发真实鼠标事件，只做流程调试（此时过不了盾） |
-| `IAMHC_PROXY_PORT` | sing-box 本地 mixed 入口端口，默认 `1081` |
+| `IAMHC_PROXY_PORT` | 本地 HTTP 代理入口端口，默认 `1081` |
+| `IAMHC_PROXY_BACKEND` | 后端选择：`auto`（默认）/ `xray` / `sing-box` |
 | `SING_BOX_PATH` | sing-box 可执行文件路径，默认从 PATH 找 |
+| `XRAY_PATH` | Xray 可执行文件路径，默认从 PATH 找 |
 
 ## 节点代理（NODE_LINK）
 
 Chrome 只支持 HTTP/SOCKS 代理，不认识 `vless://`、`vmess://`、`tuic://`、`hysteria2://`、
-`anytls://`。配置 `NODE_LINK` 后：
+`anytls://`。配置 `NODE_LINK` 后，脚本按链接的传输方式自动选后端：
 
-1. Actions 里下载并校验官方 sing-box `v1.14.0`；
-2. 把链接转成 sing-box 配置，在 `127.0.0.1:1081` 开一个 `mixed` 入站；
+| 传输方式 | 后端 | 原因 |
+|---|---|---|
+| `xhttp` / `splithttp` | Xray | Xray 是 XHTTP 的参考实现；sing-box 至今没有这个传输 |
+| 其他 | sing-box | 保留 `tuic`、`hysteria2`、`anytls`、`ss` 插件等兼容性 |
+
+具体流程：
+
+1. Actions 里下载并校验官方 sing-box `v1.14.0` 和 Xray `v26.10.31`；
+2. xhttp 链接生成 Xray 配置，其他链接生成 sing-box 配置，在 `127.0.0.1:1081` 开 HTTP 入口；
 3. 浏览器走这个本地代理（登录、过盾、签到请求都在同一个出口上）；
-4. 任务结束后自动关闭 sing-box。
+4. 任务结束后自动关闭后端进程。
 
 `socks5://host:port`、`http://host:port` 这类 Chrome 原生支持的链接会直接交给 Chrome，
-不额外启动 sing-box。支持的协议：`vless`、`vmess`、`trojan`、`ss`、`tuic`、`hysteria2`/`hy2`、
-`anytls`/`anttls`、`http(s)`、`socks(4/5)`。
+不额外启动后端。
 
-本地调试复杂节点需要先装 sing-box：
+各后端的协议范围：
+
+- **Xray**：`vless`、`vmess`、`trojan`、`ss`，传输支持 `xhttp`、`ws`、`grpc`、`httpupgrade`，
+  安全层支持 TLS / REALITY。注意 Xray 已移除 `http`/`h2`/`quic` 传输，这类节点会继续走 sing-box。
+- **sing-box**：`vless`、`vmess`、`trojan`、`ss`、`tuic`、`hysteria2`/`hy2`、`anytls`/`anttls`、
+  `http(s)`、`socks(4/5)`。`tuic` / `hysteria2` / `anytls` 只有 sing-box 支持。
+
+默认 `auto` 已经够用；要强制某个后端时设 `IAMHC_PROXY_BACKEND=xray` 或
+`IAMHC_PROXY_BACKEND=sing-box`。
+
+本地调试复杂节点需要先装后端：
 
 ```bash
-brew install sing-box
-export NODE_LINK="vless://..."
-python -m src.proxy_node --print-config   # 先确认链接能解析
+brew install sing-box xray
+export NODE_LINK="vless://...type=xhttp..."   # 或 type=ws 等
+python -m src.proxy_node --print-config > /tmp/node.json
+xray run -test -c /tmp/node.json              # xhttp 链接校验 Xray 配置
+sing-box check -c /tmp/node.json              # 其他链接校验 sing-box 配置
 ```
 
 不要把带密码的节点链接提交到仓库，只放在 Actions Secrets 里。
@@ -156,7 +176,7 @@ python checkin.py --smoke-turnstile
 | `站点启用了密码加密登录` | 站点打开了 `password_login_encryption_enabled` | 需要按 `/api/user/login/encryption-key` 补 RSA-OAEP + AES-GCM 加密 |
 | `PyAutoGUI can't be used in headless mode` | 跑成了 headless | 别加 `--headless`，Linux 上确认 `xvfb` 已安装 |
 | `import pyautogui` 直接退出 | 缺 tkinter | Linux 装 `python3-tk`；CI 的验证步骤会提前暴露 |
-| 节点代理启动失败 | 链接格式不支持 / sing-box 缺失 / 节点不可用 | `python -m src.proxy_node --print-config`，再 `sing-box check` |
+| 节点代理启动失败 | 链接格式不支持 / 后端缺失 / 节点不可用 | `python -m src.proxy_node --print-config`，xhttp 链接再用 `xray run -test -c` 校验 |
 | 升级 Chrome 后启动失败 | 驱动版本不匹配 | `sbase get uc_driver` 重新拉一份 |
 
 跑单元测试（不启浏览器）：

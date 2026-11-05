@@ -259,3 +259,108 @@ def test_node_link_env_prefers_iamhc_alias(monkeypatch):
 
     monkeypatch.delenv("IAMHC_NODE_LINK")
     assert proxy_node.node_link_from_env() == "trojan://a@b:443"
+
+
+# ---------------------------------------------------------------- XHTTP / Xray 后端
+
+REALITY_PUBLIC_KEY = "pBkAVq4but15v7DxMd5MtJKYryrehGhnJp7Oh0VWkxk"
+
+
+def _xhttp_link() -> str:
+    return (
+        "vless://11111111-2222-3333-4444-555555555555@example.com:443"
+        "?type=xhttp&security=reality&sni=www.example.com&fp=chrome"
+        f"&pbk={REALITY_PUBLIC_KEY}&sid=ab12&spx=%2F"
+        "&path=%2Fxhttp&host=cdn.example.com&mode=auto"
+        "&flow=xtls-rprx-vision"
+        "&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D"
+    )
+
+
+def test_xhttp_link_uses_xray_backend():
+    link = _xhttp_link()
+    assert proxy_node.backend_for_link(link) == "xray"
+
+    config = proxy_node.build_config(link, 1081)
+    assert config["inbounds"][0]["protocol"] == "http"
+    assert config["inbounds"][0]["port"] == 1081
+
+    outbound = config["outbounds"][0]
+    assert outbound["protocol"] == "vless"
+    stream = outbound["streamSettings"]
+    assert stream["network"] == "xhttp"
+    assert stream["security"] == "reality"
+    assert stream["realitySettings"]["publicKey"] == REALITY_PUBLIC_KEY
+    assert stream["realitySettings"]["shortId"] == "ab12"
+    assert stream["xhttpSettings"] == {
+        "path": "/xhttp",
+        "mode": "auto",
+        "host": "cdn.example.com",
+        "xPaddingBytes": "100-1000",
+    }
+
+    user = outbound["settings"]["vnext"][0]["users"][0]
+    assert user["encryption"] == "none"
+    # Vision 不能和 XHTTP 一起用，解析时应被丢掉
+    assert "flow" not in user
+
+
+def test_splithttp_alias_also_uses_xray():
+    link = _xhttp_link().replace("type=xhttp", "type=splithttp")
+    assert proxy_node.backend_for_link(link) == "xray"
+    config = proxy_node.build_config(link, 1081)
+    assert config["outbounds"][0]["streamSettings"]["network"] == "xhttp"
+
+
+def test_non_xhttp_still_uses_sing_box():
+    link = "vless://11111111-2222-3333-4444-555555555555@example.com:443?type=ws"
+    assert proxy_node.backend_for_link(link) == "sing-box"
+    config = proxy_node.build_config(link, 1081)
+    assert config["inbounds"][0]["type"] == "mixed"
+
+
+def test_backend_can_be_forced(monkeypatch):
+    link = "vless://11111111-2222-3333-4444-555555555555@example.com:443?type=ws"
+    monkeypatch.setenv(proxy_node.BACKEND_ENV, "xray")
+    assert proxy_node.backend_for_link(link) == "xray"
+    config = proxy_node.build_config(link, 1081)
+    assert config["inbounds"][0]["protocol"] == "http"
+    assert config["outbounds"][0]["streamSettings"]["network"] == "ws"
+
+
+def test_xhttp_extra_must_be_json():
+    link = _xhttp_link().replace(
+        "extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D", "extra=not-json"
+    )
+    with pytest.raises(proxy_node.UnsupportedNodeLink):
+        proxy_node.build_config(link, 1081)
+
+
+def test_vmess_xhttp_uses_xray():
+    import base64
+    import json
+
+    payload = {
+        "v": "2",
+        "ps": "test",
+        "add": "example.com",
+        "port": "443",
+        "id": "11111111-2222-3333-4444-555555555555",
+        "aid": "0",
+        "scy": "auto",
+        "net": "xhttp",
+        "type": "none",
+        "host": "cdn.example.com",
+        "path": "/xhttp",
+        "tls": "tls",
+        "sni": "www.example.com",
+    }
+    link = "vmess://" + base64.b64encode(json.dumps(payload).encode()).decode()
+
+    assert proxy_node.backend_for_link(link) == "xray"
+    config = proxy_node.build_config(link, 1081)
+    outbound = config["outbounds"][0]
+    assert outbound["protocol"] == "vmess"
+    assert outbound["streamSettings"]["network"] == "xhttp"
+    assert outbound["streamSettings"]["xhttpSettings"]["path"] == "/xhttp"
+    assert outbound["settings"]["vnext"][0]["users"][0]["alterId"] == 0

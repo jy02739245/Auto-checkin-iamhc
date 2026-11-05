@@ -7,7 +7,7 @@
 环境变量：
     EMAIL / IAMHC_EMAIL         登录邮箱（必填）
     PASSWORD / IAMHC_PASSWORD   登录密码（必填）
-    NODE_LINK                   节点分享链接（可选，经 sing-box 转成本地代理）
+    NODE_LINK                   节点分享链接（可选，经 Xray / sing-box 转成本地代理）
     TG_BOT_TOKEN / TG_CHAT_ID   Telegram 推送（可选）
     IAMHC_BASE_URL              站点地址，默认 https://api.hcnsec.cn
 
@@ -267,7 +267,7 @@ def main() -> int:
         with proxy_node.maybe_launch() as proxy_url:
             return _run_attempts(email, password, proxy_url)
     except Exception as exc:
-        # 节点解析、sing-box 启动失败属于任务失败，也要通知并给出清晰日志
+        # 节点解析、代理后端启动失败属于任务失败，也要通知并给出清晰日志
         summary = f"{type(exc).__name__}: {exc}"
         print(f"[main] 节点代理初始化失败: {summary}")
         traceback.print_exc()
